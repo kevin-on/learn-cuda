@@ -96,7 +96,7 @@ void explicitMemVecAdd(int vectorLength) {
     int blocks = cuda::ceil_div(vectorLength, threads);
     vecAdd<<<blocks, threads>>>(devA, devB, devC, vectorLength);
 
-    cudaDeviceSynchronize(); // What happens if we do not synchronize?
+    cudaDeviceSynchronize();
 
     serialVecAdd(A, B, C, vectorLength);
 
