@@ -19,6 +19,15 @@
         }                                                                                          \
     } while (0)
 
+#define CUBLAS_CHECK(call)                                                                         \
+    do {                                                                                           \
+        cublasStatus_t stat = (call);                                                              \
+        if (stat != CUBLAS_STATUS_SUCCESS) {                                                       \
+            fprintf(stderr, "cuBLAS error at %s:%d: status=%d\n", __FILE__, __LINE__, (int)stat);  \
+            exit(EXIT_FAILURE);                                                                    \
+        }                                                                                          \
+    } while (0)
+
 struct Stats {
     float mean;
     float median;

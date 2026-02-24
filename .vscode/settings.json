@@ -11,4 +11,7 @@
   "clangd.arguments": [
     "--query-driver=/home/jinpyo/cuda/bin/nvcc"
   ],
+  "[cuda-cpp]": {
+    "editor.defaultFormatter": "llvm-vs-code-extensions.vscode-clangd"
+  },
 }
