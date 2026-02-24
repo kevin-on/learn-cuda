@@ -252,10 +252,6 @@ int main(int argc, char **argv) {
     initArray(A, numElems);
     initArray(B, numElems);
 
-    float *Bt = nullptr;
-    CUDA_CHECK(cudaMallocManaged(&Bt, numElems * sizeof(float)));
-    sequentialTranspose(B, Bt, m);
-
     cublasHandle_t handle;
     CUBLAS_CHECK(cublasCreate(&handle));
 
@@ -275,6 +271,10 @@ int main(int argc, char **argv) {
 
     // Run float4SquareTileMatmulKernel
     // TODO: Include transpose latency in the benchmark
+    float *Bt = nullptr;
+    CUDA_CHECK(cudaMallocManaged(&Bt, numElems * sizeof(float)));
+    sequentialTranspose(B, Bt, m);
+
     dim3 blockFloat4SquareTile(bm, bm);
     dim3 gridFloat4SquareTile(cuda::ceil_div(m, bm), cuda::ceil_div(m, bm));
     size_t smemSizeFloat4SquareTile = (bm * (4 * bm + 1) + (4 * bm) * (bm + 1)) * sizeof(float);
