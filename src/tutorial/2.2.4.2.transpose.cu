@@ -1,4 +1,4 @@
-#include "cuda_utils.cuh"
+#include "../utils/cuda_utils.cuh"
 #include <ctime>
 #include <cuda/cmath>
 #include <stdio.h>
