@@ -14,13 +14,23 @@
  *
  *   A100 FP32 peak (NVIDIA spec) : 19.5  TFLOPS
  *   cuBLAS                       : 19.17 TFLOPS (98.3%)
- *   This kernel (bm=32)          : 3.83 TFLOPS (19.8%)
  */
 
 #define INDX(row, col, ld) ((row) * (ld) + (col))
 
-__global__ void matmulKernel(float *A, float *B, float *C, int m, int bm) {
-    // TODO: handle index out of bounds
+__global__ void squareTileMatmulKernel(float *A, float *B, float *C, int m, int bm) {
+    /**
+     * Each thread in this kernel computes a single element of the output matrix C.
+     * The kernel uses a square tile of size bm x bm to load the input matrices A and B into shared
+     * memory.
+     *
+     * Preconditions:
+     * - m is divisible by bm  // TODO: handle index out of bounds (e.g. m % bm != 0)
+     *
+     * Benchmark (8192 x 8192 x 8192 matmul on A100)
+     * - bm=16: 3.51 TFLOPS
+     * - bm=32: 3.85 TFLOPS
+     */
     extern __shared__ float smem[];
     float *tileA = smem;                 // bm x (bm+1)
     float *tileB = smem + bm * (bm + 1); // bm x bm
@@ -45,10 +55,96 @@ __global__ void matmulKernel(float *A, float *B, float *C, int m, int bm) {
     C[INDX(blockRow + threadIdx.y, blockCol + threadIdx.x, m)] = Cval;
 }
 
+__global__ void float4SquareTileMatmulKernel(float *A, float *Bt, float *C, int m, int bm) {
+    /**
+     * This kernel is a variant of the squareTileMatmulKernel that uses float4 to load global memory
+     * into shared memory.
+     *
+     * Preconditions:
+     * - m and bm are divisible by 4
+     * - Bt is a transpose of B
+     *
+     * Benchmark (8192 x 8192 x 8192 matmul on A100)
+     * - The numbers below are without transpose latency.
+     * - bm=16: 3.81 TFLOPS
+     * - bm=32: 3.96 TFLOPS
+     */
+    // TODO: handle index out of bounds
+    extern __shared__ float smem[];
+    float *tileA = smem;                       // bm x (4*bm+1)
+    float *tileB = smem + bm * ((4 * bm) + 1); // (4*bm) x (bm+1)
+
+    float4 *A4 = reinterpret_cast<float4 *>(A);   // m x (m / 4)
+    float4 *Bt4 = reinterpret_cast<float4 *>(Bt); // m x (m / 4)
+
+    int mDiv4 = m >> 2;
+    int blockRow = blockIdx.y * bm;
+    int blockCol = blockIdx.x * bm;
+
+    float Cval = 0.0f;
+    for (int i = 0; i < cuda::ceil_div(m, 4 * bm); i++) {
+        // tileA origin: (blockRow, i*4*bm)
+        // tileA4 origin: (blockRow, i*bm)
+        float4 a4 = A4[INDX(blockRow + threadIdx.y, i * bm + threadIdx.x, mDiv4)];
+        tileA[INDX(threadIdx.y, 4 * threadIdx.x, (4 * bm + 1))] = a4.x;
+        tileA[INDX(threadIdx.y, 4 * threadIdx.x + 1, (4 * bm + 1))] = a4.y;
+        tileA[INDX(threadIdx.y, 4 * threadIdx.x + 2, (4 * bm + 1))] = a4.z;
+        tileA[INDX(threadIdx.y, 4 * threadIdx.x + 3, (4 * bm + 1))] = a4.w;
+
+        // // Sanity check
+        // for (int j = 0; j < 4; j++) {
+        //     int sr = threadIdx.y;
+        //     int sc = 4 * threadIdx.x + j;
+        //     if (tileA[INDX(sr, sc, (4 * bm + 1))] != A[INDX(blockRow + sr, i * 4 * bm + sc, m)])
+        //     {
+        //         printf("Error: tileA[%d][%d] != A[%d][%d] in block (%d, %d)\n", sr, sc,
+        //                blockRow + sr, i * 4 * bm + sc, blockIdx.x, blockIdx.y);
+        //         return;
+        //     }
+        // }
+        __syncthreads();
+
+        // tileB origin: (i*4*bm, blockCol)
+        // tileBt origin: (blockCol, i*4*bm)
+        // tileBt4 origin: (blockCol, i*bm)
+        float4 bt4 = Bt4[INDX(blockCol + threadIdx.y, i * bm + threadIdx.x, mDiv4)];
+        tileB[INDX(4 * threadIdx.x, threadIdx.y, bm + 1)] = bt4.x;
+        tileB[INDX(4 * threadIdx.x + 1, threadIdx.y, bm + 1)] = bt4.y;
+        tileB[INDX(4 * threadIdx.x + 2, threadIdx.y, bm + 1)] = bt4.z;
+        tileB[INDX(4 * threadIdx.x + 3, threadIdx.y, bm + 1)] = bt4.w;
+        __syncthreads();
+
+        // // Sanity check
+        // for (int j = 0; j < 4; j++) {
+        //     int sr = 4 * threadIdx.x + j;
+        //     int sc = threadIdx.y;
+        //     if (tileB[INDX(sr, sc, bm)] != Bt[INDX(blockCol + sc, i * 4 * bm + sr, m)]) {
+        //         printf("Error: tileB[%d][%d] != Bt[%d][%d] in block (%d, %d)\n", sr, sc,
+        //                blockCol + sc, i * 4 * bm + sr, blockIdx.x, blockIdx.y);
+        //         return;
+        //     }
+        // }
+
+        for (int k = 0; k < 4 * bm; k++) {
+            Cval += tileA[INDX(threadIdx.y, k, (4 * bm + 1))] * tileB[INDX(k, threadIdx.x, bm + 1)];
+        }
+        __syncthreads();
+    }
+    C[INDX(blockRow + threadIdx.y, blockCol + threadIdx.x, m)] = Cval;
+}
+
 void initArray(float *array, int len) {
     std::srand(std::time({}));
     for (int i = 0; i < len; i++) {
         array[i] = rand() / (float)RAND_MAX;
+    }
+}
+
+void sequentialTranspose(float *A, float *At, int m) {
+    for (int i = 0; i < m; i++) {
+        for (int j = 0; j < m; j++) {
+            At[INDX(j, i, m)] = A[INDX(i, j, m)];
+        }
     }
 }
 
@@ -156,18 +252,43 @@ int main(int argc, char **argv) {
     initArray(A, numElems);
     initArray(B, numElems);
 
+    float *Bt = nullptr;
+    CUDA_CHECK(cudaMallocManaged(&Bt, numElems * sizeof(float)));
+    sequentialTranspose(B, Bt, m);
+
     cublasHandle_t handle;
     CUBLAS_CHECK(cublasCreate(&handle));
 
-    dim3 block(bm, bm);
-    dim3 grid(cuda::ceil_div(m, bm), cuda::ceil_div(m, bm));
-    size_t smemSize = (bm * (bm + 1) + bm * bm) * sizeof(float);
-    Stats matmulKernelStats;
-    auto matmulKernelResult = runKernelBenchmark<std::vector<float>>(
-        [&]() { matmulKernel<<<grid, block, smemSize>>>(A, B, C, m, bm); },
+    // Run squareTileMatmulKernel
+    dim3 blockSquareTile(bm, bm);
+    dim3 gridSquareTile(cuda::ceil_div(m, bm), cuda::ceil_div(m, bm));
+    size_t smemSizeSquareTile = (bm * (bm + 1) + bm * bm) * sizeof(float);
+    Stats squareTileMatmulKernelStats;
+    auto squareTileMatmulKernelResult = runKernelBenchmark<std::vector<float>>(
+        [&]() {
+            squareTileMatmulKernel<<<gridSquareTile, blockSquareTile, smemSizeSquareTile>>>(A, B, C,
+                                                                                            m, bm);
+        },
         [&]() { CUDA_CHECK(cudaMemset(C, 0, numElems * sizeof(float))); },
-        [&]() { return std::vector<float>(C, C + numElems); }, warmup, iters, matmulKernelStats);
+        [&]() { return std::vector<float>(C, C + numElems); }, warmup, iters,
+        squareTileMatmulKernelStats);
 
+    // Run float4SquareTileMatmulKernel
+    // TODO: Include transpose latency in the benchmark
+    dim3 blockFloat4SquareTile(bm, bm);
+    dim3 gridFloat4SquareTile(cuda::ceil_div(m, bm), cuda::ceil_div(m, bm));
+    size_t smemSizeFloat4SquareTile = (bm * (4 * bm + 1) + (4 * bm) * (bm + 1)) * sizeof(float);
+    Stats float4SquareTileMatmulKernelStats;
+    auto float4SquareTileMatmulKernelResult = runKernelBenchmark<std::vector<float>>(
+        [&]() {
+            float4SquareTileMatmulKernel<<<gridFloat4SquareTile, blockFloat4SquareTile,
+                                           smemSizeFloat4SquareTile>>>(A, Bt, C, m, bm);
+        },
+        [&]() { CUDA_CHECK(cudaMemset(C, 0, numElems * sizeof(float))); },
+        [&]() { return std::vector<float>(C, C + numElems); }, warmup, iters,
+        float4SquareTileMatmulKernelStats);
+
+    // Run cublasMatmul
     Stats cublasStats;
     auto cublasResult = runKernelBenchmark<std::vector<float>>(
         [&]() { cublasMatmul(handle, A, B, C_cublas, m); },
@@ -176,19 +297,29 @@ int main(int argc, char **argv) {
         cublasStats);
 
     double flops = 2.0 * m * m * m;
-    printStats("matmulKernel", matmulKernelStats, flops);
+    printStats("squareTileMatmulKernel", squareTileMatmulKernelStats, flops);
+    printStats("float4SquareTileMatmulKernel", float4SquareTileMatmulKernelStats, flops);
     printStats("cublasMatmul", cublasStats, flops);
 
-    if (vectorApproximatelyEqual(matmulKernelResult.data(), cublasResult.data(), numElems)) {
-        printf("matmulKernel results are correct\n");
+    if (vectorApproximatelyEqual(squareTileMatmulKernelResult.data(), cublasResult.data(),
+                                 numElems)) {
+        printf("squareTileMatmulKernel results are correct\n");
     } else {
-        printf("Error: matmulKernel results are incorrect\n");
+        printf("Error: squareTileMatmulKernel results are incorrect\n");
+    }
+
+    if (vectorApproximatelyEqual(float4SquareTileMatmulKernelResult.data(), cublasResult.data(),
+                                 numElems)) {
+        printf("float4SquareTileMatmulKernel results are correct\n");
+    } else {
+        printf("Error: float4SquareTileMatmulKernel results are incorrect\n");
     }
 
     CUBLAS_CHECK(cublasDestroy(handle));
 
     CUDA_CHECK(cudaFree(A));
     CUDA_CHECK(cudaFree(B));
+    CUDA_CHECK(cudaFree(Bt));
     CUDA_CHECK(cudaFree(C));
     CUDA_CHECK(cudaFree(C_cublas));
 
