@@ -27,6 +27,14 @@ struct Stats {
     float max;
 };
 
+void printStats(const char *name, const Stats &s, double flops = 0.0) {
+    printf("%-15s mean=%.3f ms  median=%.3f ms  std=%.3f ms  min=%.3f ms  max=%.3f ms", name,
+           s.mean, s.median, s.std_dev, s.min, s.max);
+    if (flops > 0.0)
+        printf("  %.2f TFLOPS", flops / (s.median * 1e9));
+    printf("\n");
+}
+
 Stats computeStats(std::vector<float> &times) {
     std::sort(times.begin(), times.end());
     int n = (int)times.size();
