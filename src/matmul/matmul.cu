@@ -4,6 +4,8 @@
 #include <ctime>
 #include <cublas_v2.h>
 #include <cuda/cmath>
+#include <cuda/pipeline>
+#include <cuda_pipeline.h>
 #include <getopt.h>
 #include <stdio.h>
 
@@ -14,6 +16,16 @@
  *
  *   A100 FP32 peak (NVIDIA spec) : 19.5  TFLOPS
  *   cuBLAS                       : 19.17 TFLOPS (98.3%)
+ */
+
+/**
+ * A100 specifications:
+ *
+ *   Max Warps / SM = 64
+ *   Max Threads / SM = 2048
+ *   Max Thread Blocks / SM = 32
+ *   Max Thread Block Size = 1024
+ *   Shared Memory per SM = 64 KB / Configureable up to 164KB
  */
 
 #define INDX(row, col, ld) ((row) * (ld) + (col))
@@ -30,26 +42,54 @@ __global__ void squareTileMatmulKernel(float *A, float *B, float *C, int m, int 
      * Benchmark (8192 x 8192 x 8192 matmul on A100)
      * - bm=16: 3.51 TFLOPS
      * - bm=32: 3.85 TFLOPS
+     *
+     * Analysis (bm=32):
+     * - 32x32 threads per block
+     * - 2 blocks per SM
+     * - 64 warps per block (100% occupancy)
+     *
+     * In the for loop,
+     * - Memory access latency: 400~600 cycles
+     * - Compute latency: 3*bm cycles (96 cycles for bm=32)
      */
     extern __shared__ float smem[];
-    float *tileA = smem;                 // bm x (bm+1)
-    float *tileB = smem + bm * (bm + 1); // bm x bm
+    float *tileA = smem;                     // 2 x bm x (bm + 1)
+    float *tileB = smem + 2 * bm * (bm + 1); // 2 x bm x bm
 
     int blockRow = blockIdx.y * bm;
     int blockCol = blockIdx.x * bm;
 
     float Cval = 0.0f;
-    for (int i = 0; i < cuda::ceil_div(m, bm); i++) {
-        // tileA origin: (blockRow, i*bm), tileB origin: (i*bm, blockCol)
-        tileA[INDX(threadIdx.y, threadIdx.x, (bm + 1))] =
-            A[INDX(blockRow + threadIdx.y, i * bm + threadIdx.x, m)];
-        tileB[INDX(threadIdx.y, threadIdx.x, bm)] =
-            B[INDX(i * bm + threadIdx.y, blockCol + threadIdx.x, m)];
-        __syncthreads();
 
-        for (int k = 0; k < bm; k++) {
-            Cval += tileA[INDX(threadIdx.y, k, (bm + 1))] * tileB[INDX(k, threadIdx.x, bm)];
+    // Initialize the first tile
+    tileA[INDX(threadIdx.y, threadIdx.x, (bm + 1))] =
+        A[INDX(blockRow + threadIdx.y, threadIdx.x, m)];
+    tileB[INDX(threadIdx.y, threadIdx.x, bm)] = B[INDX(threadIdx.y, blockCol + threadIdx.x, m)];
+    __syncthreads();
+
+    for (int i = 0; i < cuda::ceil_div(m, bm); i++) {
+        float *curTileA = tileA + (i & 1) * bm * (bm + 1);
+        float *nextTileA = tileA + ((i + 1) & 1) * bm * (bm + 1);
+        float *curTileB = tileB + (i & 1) * bm * bm;
+        float *nextTileB = tileB + ((i + 1) & 1) * bm * bm;
+
+        // prefetch the next tile to shared memory
+        if (i < cuda::ceil_div(m, bm) - 1) {
+            __pipeline_memcpy_async(&nextTileA[INDX(threadIdx.y, threadIdx.x, (bm + 1))],
+                                    &A[INDX(blockRow + threadIdx.y, (i + 1) * bm + threadIdx.x, m)],
+                                    sizeof(float));
+            __pipeline_memcpy_async(&nextTileB[INDX(threadIdx.y, threadIdx.x, bm)],
+                                    &B[INDX((i + 1) * bm + threadIdx.y, blockCol + threadIdx.x, m)],
+                                    sizeof(float));
+            __pipeline_commit();
         }
+
+        // compute the current tile
+        for (int k = 0; k < bm; k++) {
+            Cval += curTileA[INDX(threadIdx.y, k, (bm + 1))] * curTileB[INDX(k, threadIdx.x, bm)];
+        }
+
+        __pipeline_wait_prior(0);
         __syncthreads();
     }
     C[INDX(blockRow + threadIdx.y, blockCol + threadIdx.x, m)] = Cval;
@@ -255,10 +295,21 @@ int main(int argc, char **argv) {
     cublasHandle_t handle;
     CUBLAS_CHECK(cublasCreate(&handle));
 
+    double flops = 2.0 * m * m * m;
+
+    // Run cublasMatmul
+    Stats cublasStats;
+    auto cublasResult = runKernelBenchmark<std::vector<float>>(
+        [&]() { cublasMatmul(handle, A, B, C_cublas, m); },
+        [&]() { CUDA_CHECK(cudaMemset(C_cublas, 0, numElems * sizeof(float))); },
+        [&]() { return std::vector<float>(C_cublas, C_cublas + numElems); }, warmup, iters,
+        cublasStats);
+    printStats("cublasMatmul", cublasStats, flops);
+
     // Run squareTileMatmulKernel
     dim3 blockSquareTile(bm, bm);
     dim3 gridSquareTile(cuda::ceil_div(m, bm), cuda::ceil_div(m, bm));
-    size_t smemSizeSquareTile = (bm * (bm + 1) + bm * bm) * sizeof(float);
+    size_t smemSizeSquareTile = (2 * bm * (bm + 1) + 2 * bm * bm) * sizeof(float);
     Stats squareTileMatmulKernelStats;
     auto squareTileMatmulKernelResult = runKernelBenchmark<std::vector<float>>(
         [&]() {
@@ -268,39 +319,7 @@ int main(int argc, char **argv) {
         [&]() { CUDA_CHECK(cudaMemset(C, 0, numElems * sizeof(float))); },
         [&]() { return std::vector<float>(C, C + numElems); }, warmup, iters,
         squareTileMatmulKernelStats);
-
-    // Run float4SquareTileMatmulKernel
-    // TODO: Include transpose latency in the benchmark
-    float *Bt = nullptr;
-    CUDA_CHECK(cudaMallocManaged(&Bt, numElems * sizeof(float)));
-    sequentialTranspose(B, Bt, m);
-
-    dim3 blockFloat4SquareTile(bm, bm);
-    dim3 gridFloat4SquareTile(cuda::ceil_div(m, bm), cuda::ceil_div(m, bm));
-    size_t smemSizeFloat4SquareTile = (bm * (4 * bm + 1) + (4 * bm) * (bm + 1)) * sizeof(float);
-    Stats float4SquareTileMatmulKernelStats;
-    auto float4SquareTileMatmulKernelResult = runKernelBenchmark<std::vector<float>>(
-        [&]() {
-            float4SquareTileMatmulKernel<<<gridFloat4SquareTile, blockFloat4SquareTile,
-                                           smemSizeFloat4SquareTile>>>(A, Bt, C, m, bm);
-        },
-        [&]() { CUDA_CHECK(cudaMemset(C, 0, numElems * sizeof(float))); },
-        [&]() { return std::vector<float>(C, C + numElems); }, warmup, iters,
-        float4SquareTileMatmulKernelStats);
-
-    // Run cublasMatmul
-    Stats cublasStats;
-    auto cublasResult = runKernelBenchmark<std::vector<float>>(
-        [&]() { cublasMatmul(handle, A, B, C_cublas, m); },
-        [&]() { CUDA_CHECK(cudaMemset(C_cublas, 0, numElems * sizeof(float))); },
-        [&]() { return std::vector<float>(C_cublas, C_cublas + numElems); }, warmup, iters,
-        cublasStats);
-
-    double flops = 2.0 * m * m * m;
     printStats("squareTileMatmulKernel", squareTileMatmulKernelStats, flops);
-    printStats("float4SquareTileMatmulKernel", float4SquareTileMatmulKernelStats, flops);
-    printStats("cublasMatmul", cublasStats, flops);
-
     if (vectorApproximatelyEqual(squareTileMatmulKernelResult.data(), cublasResult.data(),
                                  numElems)) {
         printf("squareTileMatmulKernel results are correct\n");
@@ -308,18 +327,38 @@ int main(int argc, char **argv) {
         printf("Error: squareTileMatmulKernel results are incorrect\n");
     }
 
-    if (vectorApproximatelyEqual(float4SquareTileMatmulKernelResult.data(), cublasResult.data(),
-                                 numElems)) {
-        printf("float4SquareTileMatmulKernel results are correct\n");
-    } else {
-        printf("Error: float4SquareTileMatmulKernel results are incorrect\n");
-    }
+    // // Run float4SquareTileMatmulKernel
+    // // TODO: Include transpose latency in the benchmark
+    // float *Bt = nullptr;
+    // CUDA_CHECK(cudaMallocManaged(&Bt, numElems * sizeof(float)));
+    // sequentialTranspose(B, Bt, m);
+
+    // dim3 blockFloat4SquareTile(bm, bm);
+    // dim3 gridFloat4SquareTile(cuda::ceil_div(m, bm), cuda::ceil_div(m, bm));
+    // size_t smemSizeFloat4SquareTile = (bm * (4 * bm + 1) + (4 * bm) * (bm + 1)) * sizeof(float);
+    // Stats float4SquareTileMatmulKernelStats;
+    // auto float4SquareTileMatmulKernelResult = runKernelBenchmark<std::vector<float>>(
+    //     [&]() {
+    //         float4SquareTileMatmulKernel<<<gridFloat4SquareTile, blockFloat4SquareTile,
+    //                                        smemSizeFloat4SquareTile>>>(A, Bt, C, m, bm);
+    //     },
+    //     [&]() { CUDA_CHECK(cudaMemset(C, 0, numElems * sizeof(float))); },
+    //     [&]() { return std::vector<float>(C, C + numElems); }, warmup, iters,
+    //     float4SquareTileMatmulKernelStats);
+
+    // printStats("float4SquareTileMatmulKernel", float4SquareTileMatmulKernelStats, flops);
+    // if (vectorApproximatelyEqual(float4SquareTileMatmulKernelResult.data(), cublasResult.data(),
+    //                              numElems)) {
+    //     printf("float4SquareTileMatmulKernel results are correct\n");
+    // } else {
+    //     printf("Error: float4SquareTileMatmulKernel results are incorrect\n");
+    // }
+    // CUDA_CHECK(cudaFree(Bt));
 
     CUBLAS_CHECK(cublasDestroy(handle));
 
     CUDA_CHECK(cudaFree(A));
     CUDA_CHECK(cudaFree(B));
-    CUDA_CHECK(cudaFree(Bt));
     CUDA_CHECK(cudaFree(C));
     CUDA_CHECK(cudaFree(C_cublas));
 
