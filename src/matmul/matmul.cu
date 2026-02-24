@@ -14,33 +14,31 @@
  *
  *   A100 FP32 peak (NVIDIA spec) : 19.5  TFLOPS
  *   cuBLAS                       : 19.17 TFLOPS (98.3%)
- *   This kernel                  :  3.52 TFLOPS (18.1%)
+ *   This kernel (bm=32)          : 3.83 TFLOPS (19.8%)
  */
 
 #define INDX(row, col, ld) ((row) * (ld) + (col))
 
-__global__ void matmulKernel(float *A, float *B, float *C, int m, int bm, int bn, int bk) {
+__global__ void matmulKernel(float *A, float *B, float *C, int m, int bm) {
     // TODO: handle index out of bounds
     extern __shared__ float smem[];
-    float *tileA = smem;                 // bm x (bk+1)
-    float *tileB = smem + bm * (bk + 1); // bk x bn
+    float *tileA = smem;                 // bm x (bm+1)
+    float *tileB = smem + bm * (bm + 1); // bm x bm
 
     int blockRow = blockIdx.y * bm;
-    int blockCol = blockIdx.x * bn;
+    int blockCol = blockIdx.x * bm;
 
     float Cval = 0.0f;
-    for (int i = 0; i < cuda::ceil_div(m, bk); i++) {
-        // tileA origin: (blockRow, i*bk), tileB origin: (i*bk, blockCol)
-        // FIXME: Current shared memory layout logic is only correct when bk == bn == bm.
-        // Initializing shared memory with for loops is too slow.
-        tileA[INDX(threadIdx.y, threadIdx.x, (bk + 1))] =
-            A[INDX(blockRow + threadIdx.y, i * bk + threadIdx.x, m)];
-        tileB[INDX(threadIdx.y, threadIdx.x, bn)] =
-            B[INDX(i * bk + threadIdx.y, blockCol + threadIdx.x, m)];
+    for (int i = 0; i < cuda::ceil_div(m, bm); i++) {
+        // tileA origin: (blockRow, i*bm), tileB origin: (i*bm, blockCol)
+        tileA[INDX(threadIdx.y, threadIdx.x, (bm + 1))] =
+            A[INDX(blockRow + threadIdx.y, i * bm + threadIdx.x, m)];
+        tileB[INDX(threadIdx.y, threadIdx.x, bm)] =
+            B[INDX(i * bm + threadIdx.y, blockCol + threadIdx.x, m)];
         __syncthreads();
 
-        for (int k = 0; k < bk; k++) {
-            Cval += tileA[INDX(threadIdx.y, k, (bk + 1))] * tileB[INDX(k, threadIdx.x, bn)];
+        for (int k = 0; k < bm; k++) {
+            Cval += tileA[INDX(threadIdx.y, k, (bm + 1))] * tileB[INDX(k, threadIdx.x, bm)];
         }
         __syncthreads();
     }
@@ -126,30 +124,27 @@ int main(int argc, char **argv) {
             iters = atoi(optarg);
             break;
         default:
-            printf("Usage: %s <m> <bm> <bn> <bk> [--warmup N] [--iters N]\n", argv[0]);
+            printf("Usage: %s <m> <bm> [--warmup N] [--iters N]\n", argv[0]);
             return 1;
         }
     }
 
-    if (argc - optind != 4) {
-        printf("Usage: %s <m> <bm> <bn> <bk> [--warmup N] [--iters N]\n", argv[0]);
+    if (argc - optind != 2) {
+        printf("Usage: %s <m> <bm> [--warmup N] [--iters N]\n", argv[0]);
         return 1;
     }
     int m = atoi(argv[optind]);
     int bm = atoi(argv[optind + 1]);
-    int bn = atoi(argv[optind + 2]);
-    int bk = atoi(argv[optind + 3]);
 
-    if (m <= 0 || bm <= 0 || bn <= 0 || bk <= 0) {
-        printf("Error: m, bm, bn, bk must be > 0\n");
+    if (m <= 0 || bm <= 0) {
+        printf("Error: m, bm must be > 0\n");
         return 1;
     }
     if (warmup < 0 || iters <= 0) {
         printf("Error: warmup >= 0, iters > 0\n");
         return 1;
     }
-    printf("Benchmark: m=%d, bm=%d, bn=%d, bk=%d, warmup=%d, iters=%d\n", m, bm, bn, bk, warmup,
-           iters);
+    printf("Benchmark: m=%d, bm=%d, warmup=%d, iters=%d\n", m, bm, warmup, iters);
 
     size_t numElems = (size_t)m * m;
 
@@ -164,12 +159,12 @@ int main(int argc, char **argv) {
     cublasHandle_t handle;
     CUBLAS_CHECK(cublasCreate(&handle));
 
-    dim3 block(bn, bm);
-    dim3 grid(cuda::ceil_div(m, bn), cuda::ceil_div(m, bm));
-    size_t smemSize = (bm * (bk + 1) + bk * bn) * sizeof(float);
+    dim3 block(bm, bm);
+    dim3 grid(cuda::ceil_div(m, bm), cuda::ceil_div(m, bm));
+    size_t smemSize = (bm * (bm + 1) + bm * bm) * sizeof(float);
     Stats matmulKernelStats;
     auto matmulKernelResult = runKernelBenchmark<std::vector<float>>(
-        [&]() { matmulKernel<<<grid, block, smemSize>>>(A, B, C, m, bm, bn, bk); },
+        [&]() { matmulKernel<<<grid, block, smemSize>>>(A, B, C, m, bm); },
         [&]() { CUDA_CHECK(cudaMemset(C, 0, numElems * sizeof(float))); },
         [&]() { return std::vector<float>(C, C + numElems); }, warmup, iters, matmulKernelStats);
 
