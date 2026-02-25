@@ -42,6 +42,135 @@ __global__ void squareTileMatmulKernel(float *A, float *B, float *C, int m, int 
      * Benchmark (8192 x 8192 x 8192 matmul on A100)
      * - bm=16: 3.51 TFLOPS
      * - bm=32: 3.85 TFLOPS
+     */
+    extern __shared__ float smem[];
+    float *tileA = smem;                 // bm x (bm+1)
+    float *tileB = smem + bm * (bm + 1); // bm x bm
+
+    int blockRow = blockIdx.y * bm;
+    int blockCol = blockIdx.x * bm;
+
+    float Cval = 0.0f;
+    for (int i = 0; i < cuda::ceil_div(m, bm); i++) {
+        // tileA origin: (blockRow, i*bm), tileB origin: (i*bm, blockCol)
+        // Commenting out all global memory loads => 4.70 TFLOPS
+        tileA[INDX(threadIdx.y, threadIdx.x, (bm + 1))] =
+            A[INDX(blockRow + threadIdx.y, i * bm + threadIdx.x, m)];
+        tileB[INDX(threadIdx.y, threadIdx.x, bm)] =
+            B[INDX(i * bm + threadIdx.y, blockCol + threadIdx.x, m)];
+        __syncthreads();
+
+        for (int k = 0; k < bm; k++) {
+            Cval += tileA[INDX(threadIdx.y, k, (bm + 1))] * tileB[INDX(k, threadIdx.x, bm)];
+            // Cval += 1.0f * tileB[INDX(k, threadIdx.x, bm)]; => 5.72 TFLOPS (reduce shared memory
+            // access into half)
+        }
+        __syncthreads();
+    }
+    C[INDX(blockRow + threadIdx.y, blockCol + threadIdx.x, m)] = Cval;
+}
+
+__global__ void registeredSquareTileMatmulKernel(float *A, float *B, float *C, int m, int bm) {
+    /**
+     * gridDim = (m / bm, m / bm)
+     * blockDim = (bm, bm / K), where K is the number of elements computed in a single thread
+     * example: bm=64, blockDim=(64, 16) => 4 elements computed in a single thread
+     */
+
+    extern __shared__ float smem[];
+    float *tileA = smem;                  // bm x (bm + 1)
+    float *tileB = tileA + bm * (bm + 1); // bm x (bm + 1)
+
+    int blockRow = blockIdx.y * bm;
+    int blockCol = blockIdx.x * bm;
+
+    float tileC[64] = {0}; // TODO: change 64 to MAX_BM
+
+    for (int i = 0; i < cuda::ceil_div(m, bm); i++) {
+        // tileA origin: (blockRow, i*bm), tileB origin: (i*bm, blockCol)
+        // assert blockDim.x == bm
+        for (int y = threadIdx.y; y < bm; y += blockDim.y) {
+            tileA[INDX(y, threadIdx.x, (bm + 1))] = A[INDX(blockRow + y, i * bm + threadIdx.x, m)];
+            tileB[INDX(y, threadIdx.x, (bm + 1))] = B[INDX(i * bm + y, blockCol + threadIdx.x, m)];
+        }
+        __syncthreads();
+
+        for (int k = 0; k < bm; k++) {
+            float Bval = tileB[INDX(k, threadIdx.x, (bm + 1))];
+            for (int y = threadIdx.y; y < bm; y += blockDim.y) {
+                tileC[y] += tileA[INDX(y, k, (bm + 1))] * Bval;
+            }
+        }
+        __syncthreads();
+    }
+
+    for (int y = threadIdx.y; y < bm; y += blockDim.y) {
+        C[INDX(blockRow + y, blockCol + threadIdx.x, m)] = tileC[y];
+    }
+}
+
+__global__ void batchedSquareTileMatmulKernel(float *A, float *B, float *C, int m, int bm, int tm) {
+    /**
+     * Each thread in this kernel computes tm x tm elements of the output matrix C.
+     * The kernel uses a square tile of size bm x bm to load the input matrices A and B into
+     * shared memory.
+     */
+    extern __shared__ float smem[];       // smem size: bm x (bm+1) + bm x bm + bm x bm
+    float *tileA = smem;                  // bm x (bm+1)
+    float *tileB = tileA + bm * (bm + 1); // bm x bm
+    float *tileC = tileB + bm * bm;       // bm x bm
+
+    int blockRow = blockIdx.y * bm;
+    int blockCol = blockIdx.x * bm;
+
+    // initialize tileC to 0
+    for (int y = threadIdx.y; y < bm; y += blockDim.y) {
+        for (int x = threadIdx.x; x < bm; x += blockDim.x) {
+            tileC[INDX(y, x, bm)] = 0.0f;
+        }
+    }
+    for (int i = 0; i < cuda::ceil_div(m, bm); i++) {
+        // tileA origin: (blockRow, i*bm), tileB origin: (i*bm, blockCol)
+        for (int y = threadIdx.y; y < bm; y += blockDim.y) {
+            for (int x = threadIdx.x; x < bm; x += blockDim.x) {
+                __pipeline_memcpy_async(&tileA[INDX(y, x, (bm + 1))],
+                                        &A[INDX(blockRow + y, i * bm + x, m)], sizeof(float));
+                __pipeline_memcpy_async(&tileB[INDX(y, x, bm)],
+                                        &B[INDX(i * bm + y, blockCol + x, m)], sizeof(float));
+                __pipeline_commit();
+            }
+        }
+        __pipeline_wait_prior(0);
+        __syncthreads();
+
+        for (int y = threadIdx.y; y < bm; y += blockDim.y) {
+            for (int x = threadIdx.x; x < bm; x += blockDim.x) {
+                for (int k = 0; k < bm; k++) {
+                    tileC[INDX(y, x, bm)] += tileA[INDX(y, k, (bm + 1))] * tileB[INDX(k, x, bm)];
+                }
+            }
+        }
+    }
+
+    // Without __syncthreads() here, will global memory access be well-coalesced or not?
+    __syncthreads();
+
+    for (int y = threadIdx.y; y < bm; y += blockDim.y) {
+        for (int x = threadIdx.x; x < bm; x += blockDim.x) {
+            C[INDX(blockRow + y, blockCol + x, m)] = tileC[INDX(y, x, bm)];
+            tileC[INDX(y, x, bm)] = 0.0f;
+        }
+    }
+}
+
+__global__ void pipelinedSquareTileMatmulKernel(float *A, float *B, float *C, int m, int bm) {
+    /**
+     * Each thread in this kernel computes a single element of the output matrix C.
+     * The kernel uses a square tile of size bm x bm to load the input matrices A and B into shared
+     * memory.
+     *
+     * Preconditions:
+     * - m is divisible by bm  // TODO: handle index out of bounds (e.g. m % bm != 0)
      *
      * Analysis (bm=32):
      * - 32x32 threads per block
@@ -260,27 +389,28 @@ int main(int argc, char **argv) {
             iters = atoi(optarg);
             break;
         default:
-            printf("Usage: %s <m> <bm> [--warmup N] [--iters N]\n", argv[0]);
+            printf("Usage: %s <m> <bm> <tm> [--warmup N] [--iters N]\n", argv[0]);
             return 1;
         }
     }
 
-    if (argc - optind != 2) {
-        printf("Usage: %s <m> <bm> [--warmup N] [--iters N]\n", argv[0]);
+    if (argc - optind != 3) {
+        printf("Usage: %s <m> <bm> <tm> [--warmup N] [--iters N]\n", argv[0]);
         return 1;
     }
     int m = atoi(argv[optind]);
     int bm = atoi(argv[optind + 1]);
+    int tm = atoi(argv[optind + 2]);
 
-    if (m <= 0 || bm <= 0) {
-        printf("Error: m, bm must be > 0\n");
+    if (m <= 0 || bm <= 0 || tm <= 0) {
+        printf("Error: m, bm, tm must be > 0\n");
         return 1;
     }
     if (warmup < 0 || iters <= 0) {
         printf("Error: warmup >= 0, iters > 0\n");
         return 1;
     }
-    printf("Benchmark: m=%d, bm=%d, warmup=%d, iters=%d\n", m, bm, warmup, iters);
+    printf("Benchmark: m=%d, bm=%d, tm=%d, warmup=%d, iters=%d\n", m, bm, tm, warmup, iters);
 
     size_t numElems = (size_t)m * m;
 
@@ -309,7 +439,7 @@ int main(int argc, char **argv) {
     // Run squareTileMatmulKernel
     dim3 blockSquareTile(bm, bm);
     dim3 gridSquareTile(cuda::ceil_div(m, bm), cuda::ceil_div(m, bm));
-    size_t smemSizeSquareTile = (2 * bm * (bm + 1) + 2 * bm * bm) * sizeof(float);
+    size_t smemSizeSquareTile = (bm * (bm + 1) + bm * (bm + 1)) * sizeof(float);
     Stats squareTileMatmulKernelStats;
     auto squareTileMatmulKernelResult = runKernelBenchmark<std::vector<float>>(
         [&]() {
@@ -326,6 +456,73 @@ int main(int argc, char **argv) {
     } else {
         printf("Error: squareTileMatmulKernel results are incorrect\n");
     }
+
+    // // Run registeredSquareTileMatmulKernel
+    // dim3 blockRegisteredSquareTile(
+    //     bm, cuda::ceil_div(bm, tm)); // tm should be # of elements computed in a single thread
+    // dim3 gridRegisteredSquareTile(cuda::ceil_div(m, bm), cuda::ceil_div(m, bm));
+    // size_t smemSizeRegisteredSquareTile = (bm * (bm + 1) + bm * (bm + 1)) * sizeof(float);
+    // Stats registeredSquareTileMatmulKernelStats;
+    // auto registeredSquareTileMatmulKernelResult = runKernelBenchmark<std::vector<float>>(
+    //     [&]() {
+    //         registeredSquareTileMatmulKernel<<<gridRegisteredSquareTile,
+    //         blockRegisteredSquareTile,
+    //                                            smemSizeRegisteredSquareTile>>>(A, B, C, m, bm);
+    //     },
+    //     [&]() { CUDA_CHECK(cudaMemset(C, 0, numElems * sizeof(float))); },
+    //     [&]() { return std::vector<float>(C, C + numElems); }, warmup, iters,
+    //     registeredSquareTileMatmulKernelStats);
+    // printStats("registeredSquareTileMatmulKernel", registeredSquareTileMatmulKernelStats, flops);
+    // if (vectorApproximatelyEqual(registeredSquareTileMatmulKernelResult.data(),
+    // cublasResult.data(),
+    //                              numElems)) {
+    //     printf("registeredSquareTileMatmulKernel results are correct\n");
+    // } else {
+    //     printf("Error: registeredSquareTileMatmulKernel results are incorrect\n");
+    // }
+
+    // // Run batchedSquareTileMatmulKernel
+    // dim3 blockBatchedSquareTile(cuda::ceil_div(bm, tm), cuda::ceil_div(bm, tm));
+    // dim3 gridBatchedSquareTile(cuda::ceil_div(m, bm), cuda::ceil_div(m, bm));
+    // size_t smemSizeBatchedSquareTile = (bm * (bm + 1) + 2 * bm * bm) * sizeof(float);
+    // Stats batchedSquareTileMatmulKernelStats;
+    // auto batchedSquareTileMatmulKernelResult = runKernelBenchmark<std::vector<float>>(
+    //     [&]() {
+    //         batchedSquareTileMatmulKernel<<<gridBatchedSquareTile, blockBatchedSquareTile,
+    //                                         smemSizeBatchedSquareTile>>>(A, B, C, m, bm, tm);
+    //     },
+    //     [&]() { CUDA_CHECK(cudaMemset(C, 0, numElems * sizeof(float))); },
+    //     [&]() { return std::vector<float>(C, C + numElems); }, warmup, iters,
+    //     batchedSquareTileMatmulKernelStats);
+    // printStats("batchedSquareTileMatmulKernel", batchedSquareTileMatmulKernelStats, flops);
+    // if (vectorApproximatelyEqual(batchedSquareTileMatmulKernelResult.data(), cublasResult.data(),
+    //                              numElems)) {
+    //     printf("batchedSquareTileMatmulKernel results are correct\n");
+    // } else {
+    //     printf("Error: batchedSquareTileMatmulKernel results are incorrect\n");
+    // }
+
+    // // Run pipelinedSquareTileMatmulKernel
+    // dim3 blockPipelinedSquareTile(bm, bm);
+    // dim3 gridPipelinedSquareTile(cuda::ceil_div(m, bm), cuda::ceil_div(m, bm));
+    // size_t smemSizePipelinedSquareTile = (2 * bm * (bm + 1) + 2 * bm * bm) * sizeof(float);
+    // Stats pipelinedSquareTileMatmulKernelStats;
+    // auto pipelinedSquareTileMatmulKernelResult = runKernelBenchmark<std::vector<float>>(
+    //     [&]() {
+    //         pipelinedSquareTileMatmulKernel<<<gridPipelinedSquareTile, blockPipelinedSquareTile,
+    //                                           smemSizePipelinedSquareTile>>>(A, B, C, m, bm);
+    //     },
+    //     [&]() { CUDA_CHECK(cudaMemset(C, 0, numElems * sizeof(float))); },
+    //     [&]() { return std::vector<float>(C, C + numElems); }, warmup, iters,
+    //     pipelinedSquareTileMatmulKernelStats);
+    // printStats("pipelinedSquareTileMatmulKernel", pipelinedSquareTileMatmulKernelStats, flops);
+    // if (vectorApproximatelyEqual(pipelinedSquareTileMatmulKernelResult.data(),
+    // cublasResult.data(),
+    //                              numElems)) {
+    //     printf("pipelinedSquareTileMatmulKernel results are correct\n");
+    // } else {
+    //     printf("Error: pipelinedSquareTileMatmulKernel results are incorrect\n");
+    // }
 
     // // Run float4SquareTileMatmulKernel
     // // TODO: Include transpose latency in the benchmark

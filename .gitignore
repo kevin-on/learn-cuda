@@ -16,3 +16,6 @@ build/
 # logs
 logs/
 *.log
+
+# profiles
+profiles/
