@@ -37,11 +37,44 @@ struct Stats {
 };
 
 void printStats(const char *name, const Stats &s, double flops = 0.0) {
-    printf("%-15s mean=%.3f ms  median=%.3f ms  std=%.3f ms  min=%.3f ms  max=%.3f ms", name,
+    printf("%-30s mean=%.3f ms  median=%.3f ms  std=%.3f ms  min=%.3f ms  max=%.3f ms", name,
            s.mean, s.median, s.std_dev, s.min, s.max);
     if (flops > 0.0)
         printf("  %.2f TFLOPS", flops / (s.median * 1e9));
     printf("\n");
+}
+
+bool vectorApproximatelyEqual(const float *A, const float *B, int length, float abs_tol = 1e-4f,
+                              float rel_tol = 1e-4f) {
+    float max_abs_err = 0.0f;
+    float max_rel_err = 0.0f;
+    int worst_idx = -1;
+
+    for (int i = 0; i < length; i++) {
+        float a = A[i];
+        float b = B[i];
+        float abs_err = fabsf(a - b);
+        float rel_err = abs_err / fmaxf(fmaxf(fabsf(a), fabsf(b)), 1.0f);
+        float tol = abs_tol + rel_tol * fmaxf(fabsf(a), fabsf(b));
+
+        if (abs_err > max_abs_err) {
+            max_abs_err = abs_err;
+            max_rel_err = rel_err;
+            worst_idx = i;
+        }
+
+        if (abs_err > tol) {
+            printf("Error: A[%d] = %f, B[%d] = %f, abs_err = %.8f, rel_err = %.8f, tol = %.8f\n",
+                   i, a, i, b, abs_err, rel_err, tol);
+            return false;
+        }
+    }
+
+    if (worst_idx >= 0) {
+        printf("Max error: idx=%d, abs_err=%.8f, rel_err=%.8f\n", worst_idx, max_abs_err,
+               max_rel_err);
+    }
+    return true;
 }
 
 Stats computeStats(std::vector<float> &times) {
