@@ -70,9 +70,10 @@ __global__ void baseMatmulKernel(float *A, float *B, float *C, int m, int bm) {
     C[INDX(blockRow + threadIdx.y, blockCol + threadIdx.x, m)] = valC;
 }
 
-#define MAX_BM 32
-__global__ void mioOptimizedMatmulKernel(float *A, float *B, float *C, int m, int bm, int bn,
-                                         int bk) {
+constexpr int kTileM = 8;
+constexpr int kTileN = 8;
+constexpr int kTileK = 64;
+__global__ void mioOptimizedMatmulKernel(float *A, float *B, float *C, int m) {
     /**
      * Problem of base kernel:
      * - Every add instruction requires two shared memory accesses.
@@ -80,61 +81,73 @@ __global__ void mioOptimizedMatmulKernel(float *A, float *B, float *C, int m, in
      *
      * Solution:
      * - Idea: Store smem values in registers and reuse as much as possible.
-     * - A single thread block computes bm x bn elements of the output matrix C.
+     * - A single thread block computes kTileM x kTileN elements of the output matrix C.
      * - A single thread of this kernel:
-     *   (1) loads bm x 1 column of A into registers.
-     *   (2) loads 1 x bm row of B into registers.
-     *   (3) computes bm x bn elements of the output matrix C.
+     *   (1) loads kTileM x 1 column of A into registers.
+     *   (2) loads 1 x kTileN row of B into registers.
+     *   (3) computes kTileM x kTileN elements of the output matrix C.
      *   (4) A thread block aggregates the results of all threads.
-     * - gridDim: (m / bn, m / bm)
-     * - blockDim: any divisor of bk
+     * - gridDim: (m / kTileN, m / kTileM)
+     * - blockDim: any divisor of kTileK
      *   - Each thread loads & computes every threadIdx th (column of A, row of B) into registers.
      *
+     * Important Notes:
+     * - To keep kTileM x kTileN output matrix in registers, kTileM * kTileN should not exceed max
+     * registers per thread = 256 for A100. If it exceeds, output matrix will spill to local memory,
+     * which makes the kernel significantly slower.
+     *
      * Benchmark (8192 x 8192 x 8192 matmul on A100):
-     * - 0.2 TFLOPS... FIXME: SUPER SUPER SLOW...
+     * - kTileM=8, kTileN=8, kTileK=64, blockDim=16: 1.87 TFLOPS
+     * - kTileM=8, kTileN=8, kTileK=64, blockDim=32: 2.14 TFLOPS
+     * - kTileM=8, kTileN=8, kTileK=64, blockDim=64: 2.05 TFLOPS & INCORRECT RESULTS
      */
 
-    extern __shared__ float smem[];
-    float *sA = smem;                 // bm x (bk + 1)
-    float *sB = smem + bm * (bk + 1); // bk x bn
-    int ldsa = bk + 1;
-    int ldsb = bn;
+    __shared__ float sA[kTileM * (kTileK + 1)];
+    __shared__ float sB[kTileK * kTileN];
+    int ldsa = kTileK + 1;
+    int ldsb = kTileN;
 
     // global offset
-    int y0 = blockIdx.y * bm;
-    int x0 = blockIdx.x * bn;
+    int y0 = blockIdx.y * kTileM;
+    int x0 = blockIdx.x * kTileN;
 
-    float regC[MAX_BM][MAX_BM] = {0};
+    float regC[kTileM][kTileN] = {0};
 
-    for (int k0 = 0; k0 < m; k0 += bk) {
-        // Load bm x bk tile of A into shared memory
-        for (int y = 0; y < bm; y++) {
-            for (int x = threadIdx.x; x < bk; x += blockDim.x) {
-                sA[INDX(y, x, ldsa)] = A[INDX(y0 + y, k0 + x, m)];
+    for (int k0 = 0; k0 < m; k0 += kTileK) {
+        // Load kTileM x kTileK tile of A into shared memory
+        // Load kTileK x kTileN tile of B into shared memory
+        for (int y = 0; y < kTileM; y++) {
+            for (int x = threadIdx.x; x < kTileK; x += blockDim.x) {
+                __pipeline_memcpy_async(&sA[INDX(y, x, ldsa)], &A[INDX(y0 + y, k0 + x, m)],
+                                        sizeof(float));
             }
         }
-        // Load bk x bm tile of B into shared memory
-        for (int y = 0; y < bk; y++) {
-            // For simplicity, assume bn is divisible by blockDim.x
-            for (int x = threadIdx.x; x < bn; x += blockDim.x) {
-                sB[INDX(y, x, ldsb)] = B[INDX(k0 + y, x0 + x, m)];
-            }
+
+        // Assume blockDim.x is divisible by kTileN
+        int bLoadBatchSize = blockDim.x / kTileN;
+        int bLoadRow = threadIdx.x / kTileN;
+        int bLoadCol = threadIdx.x % kTileN;
+        for (int y = bLoadRow; y < kTileK; y += bLoadBatchSize) {
+            __pipeline_memcpy_async(&sB[INDX(y, bLoadCol, ldsb)],
+                                    &B[INDX(k0 + y, x0 + bLoadCol, m)], sizeof(float));
         }
+
+        __pipeline_commit();
+        __pipeline_wait_prior(0);
         __syncthreads();
 
-        // TODO: change MAX_BM to bm/bn to reduce register usage. Requires bm/bn to be constant.
-        float regA[MAX_BM] = {0};
-        float regB[MAX_BM] = {0};
+        float regA[kTileM] = {0};
+        float regB[kTileN] = {0};
 
-        for (int k = threadIdx.x; k < bk; k += blockDim.x) {
-            for (int y = 0; y < bm; y++) {
+        for (int k = threadIdx.x; k < kTileK; k += blockDim.x) {
+            for (int y = 0; y < kTileM; y++) {
                 regA[y] = sA[INDX(y, k, ldsa)];
             }
-            for (int x = 0; x < bn; x++) {
+            for (int x = 0; x < kTileN; x++) {
                 regB[x] = sB[INDX(k, x, ldsb)];
             }
-            for (int x = 0; x < bn; x++) {
-                for (int y = 0; y < bm; y++) {
+            for (int x = 0; x < kTileN; x++) {
+                for (int y = 0; y < kTileM; y++) {
                     regC[y][x] += regA[y] * regB[x];
                 }
             }
@@ -143,17 +156,35 @@ __global__ void mioOptimizedMatmulKernel(float *A, float *B, float *C, int m, in
     __syncthreads();
 
     // Write back to global memory
-    // TODO: compare with atomic add.
-    for (int offset = 0; offset < blockDim.x; offset++) {
-        int tx0 = threadIdx.x + offset;
-        if (tx0 >= blockDim.x)
-            tx0 -= blockDim.x;
-        for (int y = 0; y < bm; y++) {
-            for (int x = tx0; x < bn; x += blockDim.x) {
-                C[INDX(y0 + y, x0 + x, m)] += regC[y][x];
-            }
+
+    /**
+     * Method 1: Manual offset rotation
+     * x is runtime-computed, so the compiler cannot map regC[y][x] to a specific register.
+     * This forces regC to spill to local memory (stack).
+     */
+    // for (int offset = 0; offset < blockDim.x; offset++) {
+    //     int tx0 = threadIdx.x + offset;
+    //     if (tx0 >= blockDim.x)
+    //         tx0 -= blockDim.x;
+    //     for (int y = 0; y < kTileM; y++) {
+    //         for (int x = tx0; x < kTileN; x += blockDim.x) {
+    //             C[INDX(y0 + y, x0 + x, m)] += regC[y][x];
+    //         }
+    //     }
+    //     __syncthreads();
+    // }
+
+    /**
+     * Method 2: Atomic add
+     * Both y and x are compile-time constants, so the compiler maps each regC[y][x] to a dedicated
+     * register. No spill.
+     * But latency is similar because all threads in the block access the same addresses in the same
+     * order, maximizing atomic contention.
+     */
+    for (int y = 0; y < kTileM; y++) {
+        for (int x = 0; x < kTileN; x++) {
+            atomicAdd(&C[INDX(y0 + y, x0 + x, m)], regC[y][x]);
         }
-        __syncthreads();
     }
 }
 
@@ -235,16 +266,12 @@ void runKernel(const KernelSpec &spec, float *A, float *B, float *C, int m, int 
             [&]() { baseMatmulKernel<<<grid, block, smem>>>(A, B, C, m, bm); }, reset, fetch,
             warmup, iters, stats);
     } else if (spec.name == "mio") {
-        int bm = spec.at("bm");
-        int bn = spec.at("bn");
-        int bk = spec.at("bk");
         int bdim = spec.at("bdim");
         dim3 block(bdim);
-        dim3 grid(cuda::ceil_div(m, bn), cuda::ceil_div(m, bm));
-        size_t smem = (bm * (bk + 1) + bk * bn) * sizeof(float);
+        dim3 grid(cuda::ceil_div(m, kTileN), cuda::ceil_div(m, kTileM));
         result = runKernelBenchmark<std::vector<float>>(
-            [&]() { mioOptimizedMatmulKernel<<<grid, block, smem>>>(A, B, C, m, bm, bn, bk); },
-            reset, fetch, warmup, iters, stats);
+            [&]() { mioOptimizedMatmulKernel<<<grid, block>>>(A, B, C, m); }, reset, fetch, warmup,
+            iters, stats);
     } else {
         printf("Unknown kernel: %s\n", spec.name.c_str());
         return;
