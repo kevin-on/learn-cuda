@@ -36,7 +36,7 @@ struct Stats {
     float max;
 };
 
-void printStats(const char *name, const Stats &s, double flops = 0.0) {
+inline void printStats(const char *name, const Stats &s, double flops = 0.0) {
     printf("%-30s mean=%.3f ms  median=%.3f ms  std=%.3f ms  min=%.3f ms  max=%.3f ms", name,
            s.mean, s.median, s.std_dev, s.min, s.max);
     if (flops > 0.0)
@@ -44,7 +44,7 @@ void printStats(const char *name, const Stats &s, double flops = 0.0) {
     printf("\n");
 }
 
-bool vectorApproximatelyEqual(const float *A, const float *B, int length, float abs_tol = 1e-4f,
+inline bool vectorApproximatelyEqual(const float *A, const float *B, int length, float abs_tol = 1e-4f,
                               float rel_tol = 1e-4f) {
     float max_abs_err = 0.0f;
     float max_rel_err = 0.0f;
@@ -77,7 +77,7 @@ bool vectorApproximatelyEqual(const float *A, const float *B, int length, float 
     return true;
 }
 
-Stats computeStats(std::vector<float> &times) {
+inline Stats computeStats(std::vector<float> &times) {
     std::sort(times.begin(), times.end());
     int n = (int)times.size();
 
