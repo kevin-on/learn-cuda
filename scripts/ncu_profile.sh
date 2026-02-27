@@ -3,14 +3,18 @@ set -euo pipefail
 
 BIN="build/matmul"
 M="${1:-4096}"
-SPEC="${2:?Usage: $0 [m] <kernel-spec> [ncu-extra-args...]}"
+SPEC="${2:?Usage: $0 [m] <kernel-spec> [label] [ncu-extra-args...]}"
+LABEL="${3:-}"
 shift 2
+[[ -n "$LABEL" ]] && shift
 
 mkdir -p build profiles
 
 nvcc -O2 -lineinfo -std=c++17 -arch=sm_80 src/matmul/*.cu -o "$BIN" -lcublas
 
-REPORT="profiles/ncu_$(echo "$SPEC" | tr ':=,' '_').ncu-rep"
+SUFFIX=$(echo "$SPEC" | tr ':=,' '_')
+[[ -n "$LABEL" ]] && SUFFIX="${SUFFIX}_${LABEL}"
+REPORT="profiles/ncu_${SUFFIX}.ncu-rep"
 
 ncu --set full \
     --export "$REPORT" \

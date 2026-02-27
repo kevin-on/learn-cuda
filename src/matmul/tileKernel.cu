@@ -8,6 +8,7 @@
 
 template <int BM, int BN, int BK, int TM, int TN>
 __global__ void tileMatmulKernel(float *A, float *B, float *C, int m) {
+    // clang-format off
     /**
      * - Each thread block computes a BM x BN tile of the output matrix C.
      * - Each thread computes C entries for one (row%TM, col%TN) residue class inside the block
@@ -18,25 +19,27 @@ __global__ void tileMatmulKernel(float *A, float *B, float *C, int m) {
      * - blockDim: (BN / TN, BM / TM)
      *
      * Benchmark (8192 x 8192 x 8192 matmul on A100)
-     * Note: cuBLAS=19.16 TFLOPS, theoretical peak=19.5 TFLOPS
-     *   BM   BN   BK  TM  TN  TFLOPS
-     *   64   64    8   8   8    6.31
-     *   64   64   16   8   8    8.84
-     *   64   64   32   8   8    7.11
-     *  128  128    8   8   8    7.21
-     *  128  128   16   8   8   10.19  🔥🔥🔥 HOLY $#@% 10 TFLOPS BABY LET'S GOOOOOOOO 🚀🚀🚀🚀🚀
-     *  128  128   32   8   8    8.10
-     *   64   64    8   4   8    7.39
-     *   64   64   16   4   8    8.94
-     *   64   64   32   4   8    6.80
-     *  128  128    8   4   8    7.25
-     *   64   64    8   4  16    6.30
-     *   64   64   16   4  16    6.05
-     *   64   64   32   4  16    5.66
-     *  128  128    8   4  16    6.31
-     *  128  128   16   4  16    6.84
-     *  128  128   32   4  16    6.95
+     * Note: cuBLAS=19.18 TFLOPS, theoretical peak=19.5 TFLOPS
+     *                              w/o unroll  w/ unroll
+     *   BM   BN   BK  TM  TN      TFLOPS      TFLOPS
+     *   64   64    8   8   8        6.31       12.61
+     *   64   64   16   8   8        8.84       13.24
+     *   64   64   32   8   8        7.11       13.29
+     *  128  128    8   8   8        7.21       12.83
+     *  128  128   16   8   8       10.19       15.32
+     *  128  128   32   8   8        8.10       16.07  🔥🔥🔥 HOLY $#@% 16 TFLOPS BABY LET'S GOOOOOOOO 🚀🚀🚀🚀🚀
+     *   64   64    8   4   8        7.39       12.21
+     *   64   64   16   4   8        8.94       12.54
+     *   64   64   32   4   8        6.80       12.53
+     *  128  128    8   4   8        7.25       12.71
+     *   64   64    8   4  16        6.30       11.52
+     *   64   64   16   4  16        6.05       11.70
+     *   64   64   32   4  16        5.66        5.64
+     *  128  128    8   4  16        6.31       13.52
+     *  128  128   16   4  16        6.84       14.97
+     *  128  128   32   4  16        6.95        6.93
      */
+    // clang-format on
 
     __shared__ float sA[BM][(BK + 1)];
     __shared__ float sB[BK][BN];
@@ -62,6 +65,7 @@ __global__ void tileMatmulKernel(float *A, float *B, float *C, int m) {
         __pipeline_wait_prior(0);
         __syncthreads();
 
+#pragma unroll
         for (int ry = 0; ry < TM; ry++) {
             int sy = threadIdx.y + ry * blockDim.y;
             for (int k = 0; k < BK; k++) {
