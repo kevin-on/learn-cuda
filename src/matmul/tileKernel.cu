@@ -10,7 +10,8 @@ template <int BM, int BN, int BK, int TM, int TN>
 __global__ void tileMatmulKernel(float *A, float *B, float *C, int m) {
     /**
      * - Each thread block computes a BM x BN tile of the output matrix C.
-     * - Each thread computes a TM x TN tile of the output matrix C.
+     * - Each thread computes C entries for one (row%TM, col%TN) residue class inside the block
+     * tile.
      * - In each iteration, a thread block loads a BM x BK tile of A and a
      * BK x BN tile of B into shared memory.
      * - gridDim: (m / BN, m / BM)
