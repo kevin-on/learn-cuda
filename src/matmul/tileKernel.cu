@@ -51,6 +51,8 @@ __global__ void tileMatmulKernel(float *A, float *B, float *C, int m) {
     float regA[BK] = {0};
 
     for (int k0 = 0; k0 < m; k0 += BK) {
+
+        /* -- DRAM -> SRAM -- */
         for (int y = threadIdx.y; y < BM; y += blockDim.y) {
             for (int x = threadIdx.x; x < BK; x += blockDim.x) {
                 __pipeline_memcpy_async(&sA[y][x], &A[INDX(by0 + y, k0 + x, m)], sizeof(float));
@@ -65,6 +67,8 @@ __global__ void tileMatmulKernel(float *A, float *B, float *C, int m) {
         __pipeline_wait_prior(0);
         __syncthreads();
 
+        /* -- SRAM -> Register  -- */
+        /* -- Register @ Register => Register  -- */
 #pragma unroll
         for (int ry = 0; ry < TM; ry++) {
             int sy = threadIdx.y + ry * blockDim.y;
@@ -81,6 +85,7 @@ __global__ void tileMatmulKernel(float *A, float *B, float *C, int m) {
         __syncthreads();
     }
 
+    /* -- Register -> (Cache) -> DRAM  -- */
     for (int ry = 0; ry < TM; ry++) {
         for (int rx = 0; rx < TN; rx++) {
             int sx = threadIdx.x + rx * blockDim.x;
