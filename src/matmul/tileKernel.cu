@@ -38,6 +38,15 @@ __global__ void tileMatmulKernel(float *A, float *B, float *C, int m) {
      *  128  128    8   4  16        6.31       13.52
      *  128  128   16   4  16        6.84       14.97
      *  128  128   32   4  16        6.95        6.93
+     *
+     * Scaling across matrix sizes (BM=128, BN=128, BK=32, TM=8, TN=8, w/ unroll)
+     *      m      cuBLAS    tile
+     *   1024      15.77     8.46
+     *   2048      17.54    12.34
+     *   4096      19.02    15.43
+     *   8192      19.17    16.19  (matches row above)
+     *  16384      18.64    15.96
+     *  32768      17.27    15.70
      */
     // clang-format on
 
