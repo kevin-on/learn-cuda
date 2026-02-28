@@ -1,6 +1,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <cublas_v2.h>
+#include <cuda_bf16.h>
 #include <getopt.h>
 #include <stdio.h>
 #include <vector>
@@ -9,10 +10,10 @@
 #include "matmul.cuh"
 
 /**
- * Benchmark: 8192 x 8192 x 8192 FP32 matmul on A100
+ * Benchmark: 8192 x 8192 x 8192 BF16 matmul on A100
  *
- *   A100 FP32 peak (NVIDIA spec) : 19.5  TFLOPS
- *   cuBLAS                       : 19.17 TFLOPS (98.3%)
+ *   A100 BF16 peak (NVIDIA spec) : 312    TFLOPS
+ *   cuBLAS                       : 271.32 TFLOPS (87.0%)
  */
 
 /**
@@ -25,13 +26,9 @@
  *   Shared Memory per SM = 64 KB / Configureable up to 164KB
  */
 
-void runBaseMatmul(const MatmulBenchCtx &ctx, const KernelSpec &spec);
-void runMioMatmul(const MatmulBenchCtx &ctx, const KernelSpec &spec);
 void runTileMatmul(const MatmulBenchCtx &ctx, const KernelSpec &spec);
 
 static const std::unordered_map<std::string, RunFn> kernels = {
-    {"base", runBaseMatmul},
-    {"mio", runMioMatmul},
     {"tile", runTileMatmul},
 };
 
@@ -57,17 +54,18 @@ KernelSpec parseKernelSpec(const char *str) {
     return spec;
 }
 
-void initArray(float *arr, int len) {
+void initArray(bf16 *arr, int len) {
     std::srand(std::time(nullptr));
     for (int i = 0; i < len; i++)
-        arr[i] = rand() / (float)RAND_MAX;
+        arr[i] = __float2bfloat16(rand() / (float)RAND_MAX);
 }
 
-void cublasMatmul(cublasHandle_t handle, float *A, float *B, float *C, int m) {
+void cublasMatmul(cublasHandle_t handle, bf16 *A, bf16 *B, bf16 *C, int m) {
     const float alpha = 1.0f;
     const float beta = 0.0f;
-    CUBLAS_CHECK(
-        cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, m, m, m, &alpha, B, m, A, m, &beta, C, m));
+    CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, m, m, m, &alpha, B, CUDA_R_16BF, m,
+                              A, CUDA_R_16BF, m, &beta, C, CUDA_R_16BF, m, CUBLAS_COMPUTE_32F,
+                              CUBLAS_GEMM_DEFAULT));
 }
 
 void printUsage(const char *prog) {
@@ -117,11 +115,11 @@ int main(int argc, char **argv) {
     printf("m=%d, warmup=%d, iters=%d, kernels=%zu\n", m, warmup, iters, specs.size());
 
     size_t numElems = (size_t)m * m;
-    float *A = nullptr, *B = nullptr, *C = nullptr, *C_cublas = nullptr;
-    CUDA_CHECK(cudaMallocManaged(&A, numElems * sizeof(float)));
-    CUDA_CHECK(cudaMallocManaged(&B, numElems * sizeof(float)));
-    CUDA_CHECK(cudaMallocManaged(&C, numElems * sizeof(float)));
-    CUDA_CHECK(cudaMallocManaged(&C_cublas, numElems * sizeof(float)));
+    bf16 *A = nullptr, *B = nullptr, *C = nullptr, *C_cublas = nullptr;
+    CUDA_CHECK(cudaMallocManaged(&A, numElems * sizeof(bf16)));
+    CUDA_CHECK(cudaMallocManaged(&B, numElems * sizeof(bf16)));
+    CUDA_CHECK(cudaMallocManaged(&C, numElems * sizeof(bf16)));
+    CUDA_CHECK(cudaMallocManaged(&C_cublas, numElems * sizeof(bf16)));
     initArray(A, numElems);
     initArray(B, numElems);
 
@@ -131,10 +129,10 @@ int main(int argc, char **argv) {
     double flops = 2.0 * m * m * m;
 
     Stats cublasStats;
-    auto cublasResult = runKernelBenchmark<std::vector<float>>(
+    auto cublasResult = runKernelBenchmark<std::vector<bf16>>(
         [&]() { cublasMatmul(handle, A, B, C_cublas, m); },
-        [&]() { CUDA_CHECK(cudaMemset(C_cublas, 0, numElems * sizeof(float))); },
-        [&]() { return std::vector<float>(C_cublas, C_cublas + numElems); }, warmup, iters,
+        [&]() { CUDA_CHECK(cudaMemset(C_cublas, 0, numElems * sizeof(bf16))); },
+        [&]() { return std::vector<bf16>(C_cublas, C_cublas + numElems); }, warmup, iters,
         cublasStats);
     printStats("cublas", cublasStats, flops);
 

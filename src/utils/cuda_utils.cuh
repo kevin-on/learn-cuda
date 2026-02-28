@@ -7,6 +7,7 @@
 #include <utility>
 #include <vector>
 
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #define CUDA_CHECK(call)                                                                           \
@@ -44,15 +45,16 @@ inline void printStats(const char *name, const Stats &s, double flops = 0.0) {
     printf("\n");
 }
 
-inline bool vectorApproximatelyEqual(const float *A, const float *B, int length,
-                                     float abs_tol = 1e-4f, float rel_tol = 1e-4f) {
+template <typename T>
+inline bool vectorApproximatelyEqual(const T *A, const T *B, int length, float abs_tol = 1e-4f,
+                                     float rel_tol = 1e-4f) {
     float max_abs_err = 0.0f;
     float max_rel_err = 0.0f;
     int worst_idx = -1;
 
     for (int i = 0; i < length; i++) {
-        float a = A[i];
-        float b = B[i];
+        float a = (float)A[i];
+        float b = (float)B[i];
         float abs_err = fabsf(a - b);
         float rel_err = abs_err / fmaxf(fmaxf(fabsf(a), fabsf(b)), 1.0f);
         float tol = abs_tol + rel_tol * fmaxf(fabsf(a), fabsf(b));
@@ -75,6 +77,11 @@ inline bool vectorApproximatelyEqual(const float *A, const float *B, int length,
                max_rel_err);
     }
     return true;
+}
+
+inline bool vectorApproximatelyEqualBf16(const __nv_bfloat16 *A, const __nv_bfloat16 *B, int length,
+                                         float abs_tol = 5e-2f, float rel_tol = 5e-2f) {
+    return vectorApproximatelyEqual(A, B, length, abs_tol, rel_tol);
 }
 
 inline Stats computeStats(std::vector<float> &times) {

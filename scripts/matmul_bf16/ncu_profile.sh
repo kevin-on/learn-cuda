@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-BIN="build/matmul"
+BIN="build/matmul_bf16"
 M="${1:-4096}"
 SPEC="${2:?Usage: $0 [m] <kernel-spec> [label] [ncu-extra-args...]}"
 LABEL="${3:-}"
@@ -10,7 +10,7 @@ shift 2
 
 mkdir -p build profiles
 
-nvcc -O2 -lineinfo -std=c++17 -arch=sm_80 src/matmul/*.cu -o "$BIN" -lcublas
+nvcc -O2 -lineinfo -std=c++17 -arch=sm_80 src/matmul_bf16/*.cu -o "$BIN" -lcublas
 
 SUFFIX=$(echo "$SPEC" | tr ':=,' '_')
 [[ -n "$LABEL" ]] && SUFFIX="${SUFFIX}_${LABEL}"

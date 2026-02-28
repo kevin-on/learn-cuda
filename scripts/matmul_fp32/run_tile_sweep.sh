@@ -7,7 +7,7 @@ shift || true
 EXTRA_ARGS=("$@")
 
 mkdir -p build
-nvcc -O2 -std=c++17 -arch=sm_80 src/matmul/*.cu -o "$BIN" -lcublas
+nvcc -O2 -std=c++17 -arch=sm_80 src/matmul_fp32/*.cu -o "$BIN" -lcublas
 
 CONFIGS=(
   # 8x8 tile
