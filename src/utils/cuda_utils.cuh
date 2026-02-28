@@ -44,8 +44,8 @@ inline void printStats(const char *name, const Stats &s, double flops = 0.0) {
     printf("\n");
 }
 
-inline bool vectorApproximatelyEqual(const float *A, const float *B, int length, float abs_tol = 1e-4f,
-                              float rel_tol = 1e-4f) {
+inline bool vectorApproximatelyEqual(const float *A, const float *B, int length,
+                                     float abs_tol = 1e-4f, float rel_tol = 1e-4f) {
     float max_abs_err = 0.0f;
     float max_rel_err = 0.0f;
     int worst_idx = -1;
@@ -64,8 +64,8 @@ inline bool vectorApproximatelyEqual(const float *A, const float *B, int length,
         }
 
         if (abs_err > tol) {
-            printf("Error: A[%d] = %f, B[%d] = %f, abs_err = %.8f, rel_err = %.8f, tol = %.8f\n",
-                   i, a, i, b, abs_err, rel_err, tol);
+            printf("Error: A[%d] = %f, B[%d] = %f, abs_err = %.8f, rel_err = %.8f, tol = %.8f\n", i,
+                   a, i, b, abs_err, rel_err, tol);
             return false;
         }
     }

@@ -76,8 +76,8 @@
 //     config.numAttrs = 1;
 //     config.attrs = attribute;
 
-//     cudaLaunchKernelEx(&config, clusterHistogram, bins, nbins, nbins_per_block, input, array_size);
-//     CUDA_CHECK(cudaGetLastError());
+//     cudaLaunchKernelEx(&config, clusterHistogram, bins, nbins, nbins_per_block, input,
+//     array_size); CUDA_CHECK(cudaGetLastError());
 // }
 
 __global__ void globalHistogram(int *bins, const int nbins, const int *__restrict__ input,
@@ -224,8 +224,8 @@ int main(int argc, char **argv) {
     // cudaMemset(&bins_dsm_dev, 0, nbins * sizeof(int));
     // int cluster_size = 2;
     // int threads_dsm = 256;
-    // launchClusterHistogram(threads_dsm, cluster_size, bins_dsm_dev, nbins, input_dev, array_size);
-    // cudaMemcpy(bins_dsm, bins_dsm_dev, nbins * sizeof(int), cudaMemcpyDeviceToHost);
+    // launchClusterHistogram(threads_dsm, cluster_size, bins_dsm_dev, nbins, input_dev,
+    // array_size); cudaMemcpy(bins_dsm, bins_dsm_dev, nbins * sizeof(int), cudaMemcpyDeviceToHost);
 
     // Compare results
     bool is_correct = true;
